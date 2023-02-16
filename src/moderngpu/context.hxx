@@ -11,7 +11,8 @@ BEGIN_MGPU_NAMESPACE
 
 enum memory_space_t { 
   memory_space_device = 0, 
-  memory_space_host = 1 
+  memory_space_host = 1 ,
+  memory_space_external = 2
 };
 
 
@@ -21,22 +22,22 @@ inline std::string device_prop_string(cudaDeviceProp prop) {
 
   size_t freeMem, totalMem;
   cudaError_t result = cudaMemGetInfo(&freeMem, &totalMem);
-  if(cudaSuccess != result) throw cuda_exception_t(result);  
+  if(cudaSuccess != result) throw cuda_exception_t(result);
 
   double memBandwidth = (prop.memoryClockRate * 1000.0) *
-    (prop.memoryBusWidth / 8 * 2) / 1.0e9;
+                        (prop.memoryBusWidth / 8 * 2) / 1.0e9;
 
   std::string s = detail::stringprintf(
-    "%s : %8.3lf Mhz   (Ordinal %d)\n"
-    "%d SMs enabled. Compute Capability sm_%d%d\n"
-    "FreeMem: %6dMB   TotalMem: %6dMB   %2d-bit pointers.\n"
-    "Mem Clock: %8.3lf Mhz x %d bits   (%5.1lf GB/s)\n"
-    "ECC %s\n\n",
-    prop.name, prop.clockRate / 1000.0, ordinal,
-    prop.multiProcessorCount, prop.major, prop.minor,
-    (int)(freeMem / (1<< 20)), (int)(totalMem / (1<< 20)), 8 * sizeof(int*),
-    prop.memoryClockRate / 1000.0, prop.memoryBusWidth, memBandwidth,
-    prop.ECCEnabled ? "Enabled" : "Disabled");
+      "%s : %8.3lf Mhz   (Ordinal %d)\n"
+      "%d SMs enabled. Compute Capability sm_%d%d\n"
+      "FreeMem: %6dMB   TotalMem: %6dMB   %2d-bit pointers.\n"
+      "Mem Clock: %8.3lf Mhz x %d bits   (%5.1lf GB/s)\n"
+      "ECC %s\n\n",
+      prop.name, prop.clockRate / 1000.0, ordinal,
+      prop.multiProcessorCount, prop.major, prop.minor,
+      (int)(freeMem / (1<< 20)), (int)(totalMem / (1<< 20)), 8 * sizeof(int*),
+      prop.memoryClockRate / 1000.0, prop.memoryBusWidth, memBandwidth,
+      prop.ECCEnabled ? "Enabled" : "Disabled");
   return s;
 }
 
@@ -52,7 +53,7 @@ struct context_t {
   context_t(const context_t& rhs) = delete;
   context_t& operator=(const context_t& rhs) = delete;
 
-  virtual const cudaDeviceProp& props() const = 0; 
+  virtual const cudaDeviceProp& props() const = 0;
   virtual int ptx_version() const = 0;
   virtual cudaStream_t stream() = 0;
 
@@ -82,7 +83,7 @@ protected:
   cudaEvent_t _event;
 
   // Making this a template argument means we won't generate an instance
-  // of dummy_k for each translation unit. 
+  // of dummy_k for each translation unit.
   template<int dummy_arg = 0>
   void init() {
     cudaFuncAttributes attr;
@@ -93,15 +94,15 @@ protected:
     int ord;
     cudaGetDevice(&ord);
     cudaGetDeviceProperties(&_props, ord);
-    
+
     cudaEventCreate(&_timer[0]);
     cudaEventCreate(&_timer[1]);
-    cudaEventCreate(&_event);    
+    cudaEventCreate(&_event);
   }
 
 public:
-  standard_context_t(bool print_prop = true, cudaStream_t stream_ = 0) : 
-    context_t(), _stream(stream_) {
+  standard_context_t(bool print_prop = true, cudaStream_t stream_ = 0) :
+                                                                         context_t(), _stream(stream_) {
 
     init();
     if(print_prop) {
@@ -122,27 +123,27 @@ public:
   virtual void* alloc(size_t size, memory_space_t space) {
     void* p = nullptr;
     if(size) {
-      cudaError_t result = (memory_space_device == space) ? 
-        cudaMalloc(&p, size) :
-        cudaMallocHost(&p, size);
+      cudaError_t result = (memory_space_host != space) ?
+                                                          cudaMalloc(&p, size) :
+                                                          cudaMallocHost(&p, size);
       if(cudaSuccess != result) throw cuda_exception_t(result);
     }
-    return p;    
+    return p;
   }
 
   virtual void free(void* p, memory_space_t space) {
     if(p) {
-      cudaError_t result = (memory_space_device == space) ? 
-        cudaFree(p) :
-        cudaFreeHost(p);
+      cudaError_t result = (memory_space_host != space) ?
+                                                          cudaFree(p) :
+                                                          cudaFreeHost(p);
       if(cudaSuccess != result) throw cuda_exception_t(result);
     }
   }
 
   virtual void synchronize() {
-    cudaError_t result = _stream ? 
-      cudaStreamSynchronize(_stream) : 
-      cudaDeviceSynchronize();
+    cudaError_t result = _stream ?
+                                 cudaStreamSynchronize(_stream) :
+                                 cudaDeviceSynchronize();
     if(cudaSuccess != result) throw cuda_exception_t(result);
   }
 
@@ -170,6 +171,7 @@ class mem_t {
   type_t* _pointer;
   size_t _size;
   memory_space_t _space;
+  cudaExternalMemory_t _external_memory;
 
 public:
   void swap(mem_t& rhs) {
@@ -177,17 +179,40 @@ public:
     std::swap(_pointer, rhs._pointer);
     std::swap(_size, rhs._size);
     std::swap(_space, rhs._space);
+    std::swap(_external_memory, rhs._external_memory);
   }
 
-  mem_t() : _context(nullptr), _pointer(nullptr), _size(0), 
-    _space(memory_space_device) { }
+  mem_t() : _context(nullptr), _pointer(nullptr), _size(0),
+            _space(memory_space_device), _external_memory(nullptr) { }
   mem_t& operator=(const mem_t& rhs) = delete;
   mem_t(const mem_t& rhs) = delete;
 
-  mem_t(size_t size, context_t& context, 
-    memory_space_t space = memory_space_device) :
-    _context(&context), _pointer(nullptr), _size(size), _space(space) {
-    _pointer = (type_t*)context.alloc(sizeof(type_t) * size, space);
+  mem_t(size_t size, context_t& context,
+        memory_space_t space = memory_space_device, void* handle = nullptr, size_t memorySize = 0, size_t memoryOffset = 0) :
+          _context(&context), _pointer(nullptr), _size(size), _space(space), _external_memory(nullptr) {
+    if (space == memory_space_external) {
+      cudaExternalMemoryHandleDesc external_memory_handle_desc = {};
+      external_memory_handle_desc.size = memorySize;
+#ifdef _WIN64
+      external_memory_handle_desc.type = cudaExternalMemoryHandleTypeOpaqueWin32;
+      external_memory_handle_desc.handle.win32.handle = handle;
+#else
+      external_memory_handle_desc.type = cudaExternalMemoryHandleTypeOpaqueFd;
+      external_memory_handle_desc.handle.fd = handle;
+#endif
+
+      cudaError_t result = cudaImportExternalMemory(&_external_memory, &external_memory_handle_desc);
+      if (cudaSuccess != result) throw cuda_exception_t(result);
+
+      cudaExternalMemoryBufferDesc external_mem_buffer_desc = {};
+      external_mem_buffer_desc.offset = memoryOffset;
+      external_mem_buffer_desc.size = sizeof(type_t) * size;
+
+      result = cudaExternalMemoryGetMappedBuffer((void**)&_pointer, _external_memory, &external_mem_buffer_desc);
+      if (cudaSuccess != result) throw cuda_exception_t(result);
+    } else {
+      _pointer = (type_t*)context.alloc(sizeof(type_t) * size, space);
+    }
   }
 
   mem_t(mem_t&& rhs) : mem_t() {
@@ -199,7 +224,13 @@ public:
   }
 
   ~mem_t() {
-    if(_context && _pointer) _context->free(_pointer, _space);
+    if(_context && _pointer) {
+      if (_space == memory_space_external) {
+        cudaDestroyExternalMemory(_external_memory);
+      }
+
+      _context->free(_pointer, _space);
+    }
     _pointer = nullptr;
     _size = 0;
   }
@@ -212,7 +243,7 @@ public:
   // Return a deep copy of this container.
   mem_t clone() {
     mem_t cloned(size(), context(), space());
-    if(memory_space_device) dtod(cloned.data(), data(), size());
+    if(_space != memory_space_host) dtod(cloned.data(), data(), size());
     else htoh(cloned.data(), data(), size());
     return cloned;
   }
